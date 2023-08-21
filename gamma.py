@@ -4,26 +4,33 @@ import scipy
 from scipy.stats import norm
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta, date
+import re
+from numpy import nanmin, nanmax
+
 
 pd.options.display.float_format = '{:,.4f}'.format
 
 # Inputs and Parameters
-filename = 'amd_quotedata.csv'
+filename = 'spx_quotedata.csv'
 
 # Black-Scholes European-Options Gamma
 def calcGammaEx(S, K, vol, T, r, q, optType, OI):
-    if T == 0 or vol == 0:
-        return 0
+    try:
+        if T == 0 or vol == 0:
+            return 0
 
-    dp = (np.log(S/K) + (r - q + 0.5*vol**2)*T) / (vol*np.sqrt(T))
-    dm = dp - vol*np.sqrt(T) 
+        dp = (np.log(S/K) + (r - q + 0.5*vol**2)*T) / (vol*np.sqrt(T))
+        dm = dp - vol*np.sqrt(T) 
 
-    if optType == 'call':
-        gamma = np.exp(-q*T) * norm.pdf(dp) / (S * vol * np.sqrt(T))
-        return OI * 100 * S * S * 0.01 * gamma 
-    else: # Gamma is same for calls and puts. This is just to cross-check
-        gamma = K * np.exp(-r*T) * norm.pdf(dm) / (S * S * vol * np.sqrt(T))
-        return OI * 100 * S * S * 0.01 * gamma 
+        if optType == 'call':
+            gamma = np.exp(-q*T) * norm.pdf(dp) / (S * vol * np.sqrt(T))
+            return OI * 100 * S * S * 0.01 * gamma 
+        else: # Gamma is same for calls and puts. This is just to cross-check
+            gamma = K * np.exp(-r*T) * norm.pdf(dm) / (S * S * vol * np.sqrt(T))
+            return OI * 100 * S * S * 0.01 * gamma 
+    except (ValueError, TypeError):
+        # Handle the exception when invalid input is encountered
+        return 0  # Provide a fallback value or handle the error appropriately
 
 def isThirdFriday(d):
     return d.weekday() == 4 and 15 <= d.day <= 21
@@ -36,21 +43,32 @@ optionsFile.close()
 # Get SPX Spot
 spotLine = optionsFileData[1]
 spotPrice = float(spotLine.split('Last:')[1].split(',')[0])
-fromStrike = 0.8 * spotPrice
-toStrike = 1.2 * spotPrice
+fromStrike = 0.995 * spotPrice
+toStrike = 1.005 * spotPrice
 
 # Get Today's Date
 dateLine = optionsFileData[2]
-todayDateComponents = dateLine.split('Date: ')[1].split(' ')
+todayDate = dateLine.split('Date: ')[1].split('"')
 
-# Extracting year, month, and day
-year = int(todayDateComponents[2])
-month = todayDateComponents[0]
-day = int(todayDateComponents[1].strip(','))
+monthDay = todayDate[0].split(' ')
+namechange = monthDay[0]
+monthDay[0] = datetime.strptime(namechange, '%B').month
+monthDay[1] = monthDay[1].strip(",")
+#(done to check month is correct - works)
+#print(f" monthDay : {monthDay}")   
+#print(todayDate[0].split(" "))
+#   # Handling of US/EU date formats
+    # if len(monthDay) == 2:
+year = int(monthDay[2])
+month = monthDay[0]
+day = int(monthDay[1])
+# else:
+#     year = int(monthDay[2])
+#     month = monthDay[1]
+#     day = int(monthDay[0])
 
-
-todayDate = datetime.strptime(month,'%B')
-todayDate = todayDate.replace(day=day, year=year)
+todayDate = datetime(year,month,day)
+# todayDate = todayDate.replace(day=day, year=year)
 
 # Get SPX Options Data
 df = pd.read_csv(filename, sep=",", header=None, skiprows=4)
@@ -76,8 +94,10 @@ df['CallGEX'] = df['CallGamma'] * df['CallOpenInt'] * 100 * spotPrice * spotPric
 df['PutGEX'] = df['PutGamma'] * df['PutOpenInt'] * 100 * spotPrice * spotPrice * 0.01 * -1
 
 df['TotalGamma'] = (df.CallGEX + df.PutGEX) / 10**9
-dfAgg = df.groupby(['StrikePrice']).sum()
-strikes = dfAgg.index.values
+dfAgg = df.groupby('StrikePrice').agg({'TotalGamma': 'sum', 'CallGEX': 'sum', 'PutGEX': 'sum'}).reset_index()
+
+strikes = dfAgg['StrikePrice'].values
+
 
 # Chart 1: Absolute Gamma Exposure
 plt.grid()
@@ -145,15 +165,19 @@ totalGammaExFri = np.array(totalGammaExFri) / 10**9
 # Find Gamma Flip Point
 zeroCrossIdx = np.where(np.diff(np.sign(totalGamma)))[0]
 
-negGamma = totalGamma[zeroCrossIdx]
-posGamma = totalGamma[zeroCrossIdx+1]
-negStrike = levels[zeroCrossIdx]
-posStrike = levels[zeroCrossIdx+1]
+if len(zeroCrossIdx) == 0:
+    # No gamma flip point found
+    zeroGamma = None
+else:
+    negGamma = totalGamma[zeroCrossIdx]
+    posGamma = totalGamma[zeroCrossIdx+1]
+    negStrike = levels[zeroCrossIdx]
+    posStrike = levels[zeroCrossIdx+1]
 
-zeroGamma = posStrike - ((posStrike - negStrike) * posGamma/(posGamma-negGamma))
-zeroGamma = zeroGamma[0]
+    zeroGamma = posStrike - ((posStrike - negStrike) * posGamma/(posGamma-negGamma))
+    zeroGamma = zeroGamma[0]  # Access the first element if multiple points are found
 
-# Chart 3: Gamma Exposure Profile
+## Chart 3: Gamma Exposure Profile
 fig, ax = plt.subplots()
 plt.grid()
 plt.plot(levels, totalGamma, label="All Expiries")
@@ -164,11 +188,22 @@ plt.title(chartTitle, fontweight="bold", fontsize=20)
 plt.xlabel('Index Price', fontweight="bold")
 plt.ylabel('Gamma Exposure ($ billions/1% move)', fontweight="bold")
 plt.axvline(x=spotPrice, color='r', lw=1, label="SPX Spot: " + str("{:,.0f}".format(spotPrice)))
-plt.axvline(x=zeroGamma, color='g', lw=1, label="Gamma Flip: " + str("{:,.0f}".format(zeroGamma)))
+if zeroGamma is not None:
+    plt.axvline(x=zeroGamma, color='g', lw=1, label="Gamma Flip: " + str("{:,.0f}".format(zeroGamma)))
 plt.axhline(y=0, color='grey', lw=1)
 plt.xlim([fromStrike, toStrike])
 trans = ax.get_xaxis_transform()
-plt.fill_between([fromStrike, zeroGamma], min(totalGamma), max(totalGamma), facecolor='red', alpha=0.1, transform=trans)
-plt.fill_between([zeroGamma, toStrike], min(totalGamma), max(totalGamma), facecolor='green', alpha=0.1, transform=trans)
+
+try:
+    valid_totalGamma = np.array(totalGamma)
+    valid_totalGamma[np.logical_not(np.isfinite(valid_totalGamma))] = np.nan  # Set invalid values to NaN
+    plt.fill_between([fromStrike, zeroGamma], nanmin(valid_totalGamma), nanmax(valid_totalGamma), facecolor='red', alpha=0.1, transform=trans)
+    plt.fill_between([zeroGamma, toStrike], nanmin(valid_totalGamma), nanmax(valid_totalGamma), facecolor='green', alpha=0.1, transform=trans)
+except ValueError:
+    # Handle the exception when invalid values are encountered
+    pass  # Ignore the fill_between operation if it raises an error
+
 plt.legend()
 plt.show()
+
+
